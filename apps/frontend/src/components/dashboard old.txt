@@ -1,0 +1,135 @@
+// src/pages/Dashboard.jsx
+import React from "react";
+import { COLORS } from "../constants.js";
+import Header from "../components/Header.jsx";
+import Footer from "../components/Footer.jsx";
+
+function Dashboard() {
+  const user = { name: "Oluwafemi", role: "lecturer" }; // change role to test: "student", "lecturer", "admin"
+
+  const summaryStyle = {
+    backgroundColor: "#FFE0CC",
+    padding: "1.5rem",
+    borderRadius: "10px",
+    textAlign: "center",
+    flex: "1 1 220px",
+    margin: "0.75rem",
+    boxShadow: "0 2px 6px rgba(0,0,0,0.1)",
+    fontSize: "18px",
+    fontWeight: "bold",
+  };
+
+  const buttonStyle = {
+    backgroundColor: COLORS.primary,
+    color: "#fff",
+    padding: "1.2rem",
+    border: "none",
+    borderRadius: "10px",
+    cursor: "pointer",
+    fontSize: "18px",
+    fontWeight: "bold",
+    width: "100%",
+  };
+
+  const buttonGridStyle = {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gap: "1.5rem",
+    marginTop: "2rem",
+  };
+
+  // Student dashboard
+  const renderStudentDashboard = () => (
+    <div style={{ marginTop: "4rem", marginBottom: "4rem" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", marginBottom: "3rem" }}>
+        <div style={summaryStyle}>📚 Enrolled Courses: 3</div>
+        <div style={summaryStyle}>📖 Unlocked Topics: 7</div>
+        <div style={summaryStyle}>📝 Submitted Assignments: 5</div>
+        <div style={summaryStyle}>🎯 TRCN Attempts: 2</div>
+      </div>
+
+      <div style={buttonGridStyle}>
+        <button style={buttonStyle}>View Courses</button>
+        <button style={buttonStyle}>View Assignments</button>
+        <button style={buttonStyle}>Start TRCN Practice</button>
+        <button style={buttonStyle}>View Payment History</button>
+      </div>
+    </div>
+  );
+
+  // Lecturer dashboard
+  const renderLecturerDashboard = () => (
+    <div style={{ marginTop: "4rem", marginBottom: "4rem" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", marginBottom: "3rem" }}>
+        <div style={summaryStyle}>📚 Total Courses: 4</div>
+        <div style={summaryStyle}>📖 Total Topics: 12</div>
+        <div style={summaryStyle}>👩‍🎓 Total Students: 85</div>
+        <div style={summaryStyle}>📝 Pending Assignments: 6</div>
+      </div>
+
+      <div style={buttonGridStyle}>
+        <button style={buttonStyle}>Manage Courses & Topics</button>
+        <button style={buttonStyle}>Manage Assignments</button>
+        <button style={buttonStyle}>View Students</button>
+      </div>
+    </div>
+  );
+
+  // Admin dashboard
+  const renderAdminDashboard = () => (
+    <div style={{ marginTop: "4rem", marginBottom: "4rem" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", marginBottom: "3rem" }}>
+        <div style={summaryStyle}>👥 Total Users: 120</div>
+        <div style={summaryStyle}>💳 Total Payments: ₦250,000</div>
+        <div style={summaryStyle}>📊 Reports Generated: 15</div>
+        <div style={summaryStyle}>⚙️ Active Courses: 8</div>
+      </div>
+
+      <div style={buttonGridStyle}>
+        <button style={buttonStyle}>Manage Users</button>
+        <button style={buttonStyle}>📘 Manage Content</button> {/* NEW BUTTON */}
+        <button style={buttonStyle}>Monitor Payments</button>
+        <button style={buttonStyle}>View Reports</button>
+        <button style={buttonStyle}>System Settings</button>
+        <button style={{ ...buttonStyle, backgroundColor: "#FF5500" }}>
+          End Semester (Clear All Submissions)
+        </button>
+      </div>
+    </div>
+  );
+
+  const renderDashboard = () => {
+    switch (user.role) {
+      case "student":
+        return renderStudentDashboard();
+      case "lecturer":
+        return renderLecturerDashboard();
+      case "admin":
+        return renderAdminDashboard();
+      default:
+        return <p>No role assigned. Please log in.</p>;
+    }
+  };
+
+  return (
+    <div
+      style={{
+        backgroundColor: COLORS.background,
+        color: COLORS.text,
+        minHeight: "100vh",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <Header user={user} />
+
+      <main style={{ flex: 1, padding: "2rem" }}>
+        {renderDashboard()}
+      </main>
+
+      <Footer />
+    </div>
+  );
+}
+
+export default Dashboard;

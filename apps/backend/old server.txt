@@ -1,0 +1,1166 @@
+require('dotenv').config();const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { PRICING, validateMatricNumber } = require('./utils/constants');const app = express();
+const port = process.env.PORT || 4000;// CORS & JSON
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json());// Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Missing Supabase URL or ANON KEY in .env');
+  process.exit(1);
+}
+const supabase = createClient(supabaseUrl, supabaseKey);// ========= JWT AUTH =========
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Expect "Bearer TOKEN"
+  if (!token) return res.status(401).json({ error: 'Access denied. No token provided.' });  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = payload; // { id, role }
+    next();
+  });
+}function authorizeRoles(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden: insufficient role' });
+    }
+    next();
+  };
+}// ========= OWNERSHIP & PAYMENT HELPERS =========
+async function isLecturerOwnerOfCourse(courseId, lecturerProfileId) {
+  const { data, error } = await supabase
+    .from('courses')
+    .select('id, lecturer_id')
+    .eq('id', courseId)
+    .single();
+  if (error || !data) return false;
+  return data.lecturer_id === lecturerProfileId;
+}async function isLecturerOwnerOfTopic(topicId, lecturerProfileId) {
+  const { data, error } = await supabase
+    .from('topics')
+    .select('id, course_id')
+    .eq('id', topicId)
+    .single();
+  if (error || !data) return false;
+  return isLecturerOwnerOfCourse(data.course_id, lecturerProfileId);
+}async function isLecturerOwnerOfAssignment(assignmentId, lecturerProfileId) {
+  const { data, error } = await supabase
+    .from('assignments')
+    .select('id, topic_id')
+    .eq('id', assignmentId)
+    .single();
+  if (error || !data) return false;
+  return isLecturerOwnerOfTopic(data.topic_id, lecturerProfileId);
+}async function hasStudentPaidForCourse(courseId, studentProfileId) {
+  const { data, error } = await supabase
+    .from('payments')
+    .select('id, status')
+    .eq('course_id', courseId)
+    .eq('student_id', studentProfileId)
+    .eq('status', 'paid')
+    .maybeSingle();
+  if (error) return false;
+  return !!data;
+}async function hasStudentPaidForTopic(topicId, studentProfileId) {
+  const { data, error } = await supabase
+    .from('payments')
+    .select('id, status')
+    .eq('topic_id', topicId)
+    .eq('student_id', studentProfileId)
+    .eq('status', 'paid')
+    .maybeSingle();
+  if (error) return false;
+  return !!data;
+}// ========= ROOT =========
+app.get('/', (req, res) => {
+  res.send(BOSSTIPZ Backend running on port ${port} - Auth & RBAC ready );
+});// ========= AUTH =========
+// Signup
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { full_name, email, password, role, matric_number, school_name, level } = req.body;if (!['admin', 'lecturer', 'student'].includes(role)) {
+  return res.status(400).json({ error: 'Invalid role' });
+}
+if (role === 'student' && !validateMatricNumber(matric_number)) {
+  return res.status(400).json({ error: 'Invalid matric number format' });
+}
+
+// Check duplicate email
+const { data: existingEmail } = await supabase
+  .from('profiles')
+  .select('id')
+  .eq('email', email)
+  .maybeSingle();
+if (existingEmail) {
+  return res.status(400).json({ error: 'Email already registered' });
+}
+
+// Check duplicate matric_number for students
+if (role === 'student' && matric_number) {
+  const { data: existingMatric } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('matric_number', matric_number)
+    .maybeSingle();
+  if (existingMatric) {
+    return res.status(400).json({ error: 'Matric number already registered' });
+  }
+}
+
+const hashedPassword = await bcrypt.hash(password, 10);
+const newUserId = crypto.randomUUID();
+
+const { data, error } = await supabase
+  .from('profiles')
+  .insert([{
+    user_id: newUserId,
+    full_name,
+    email,
+    password: hashedPassword,
+    role,
+    matric_number: role === 'student' ? matric_number : null,
+    school_name,
+    level
+  }])
+  .select();
+
+if (error) throw error;
+
+const token = jwt.sign(
+  { id: data[0].id, role: data[0].role },
+  process.env.JWT_SECRET,
+  { expiresIn: '7d' }
+);
+
+res.json({ message: 'Signup successful', user: data[0], token });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Login
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;const { data: user } = await supabase
+  .from('profiles')
+  .select('*')
+  .eq('email', email)
+  .single();
+
+if (!user) return res.status(400).json({ error: 'Invalid email or password' });
+
+const validPassword = await bcrypt.compare(password, user.password);
+if (!validPassword) return res.status(400).json({ error: 'Invalid email or password' });
+
+const token = jwt.sign(
+  { id: user.id, role: user.role },
+  process.env.JWT_SECRET,
+  { expiresIn: '7d' }
+);
+
+res.json({ message: 'Login successful', user, token });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= PROFILES (SECURE LISTING) =========
+app.get('/profiles-secure', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role === 'admin') {
+      const { data, error } = await supabase.from('profiles').select('*');
+      if (error) throw error;
+      return res.json({ message: 'Admin access: all profiles', profiles: data, accessedBy: req.user.role });
+    }if (req.user.role === 'lecturer') {
+  const { data: courses } = await supabase
+    .from('courses')
+    .select('id')
+    .eq('lecturer_id', req.user.id);
+
+  const courseIds = (courses || []).map(c => c.id);
+  if (courseIds.length === 0) return res.json({ message: 'No courses owned', profiles: [], accessedBy: req.user.role });
+
+  const { data: paidStudentsCourse } = await supabase
+    .from('payments')
+    .select('student_id')
+    .in('course_id', courseIds)
+    .eq('status', 'paid');
+
+  // Also include topic-level payments for topics inside lecturer courses
+  const { data: courseTopics } = await supabase
+    .from('topics')
+    .select('id')
+    .in('course_id', courseIds);
+
+  const topicIds = (courseTopics || []).map(t => t.id);
+  let paidStudentsTopic = [];
+  if (topicIds.length) {
+    const { data: pst } = await supabase
+      .from('payments')
+      .select('student_id')
+      .in('topic_id', topicIds)
+      .eq('status', 'paid');
+    paidStudentsTopic = pst || [];
+  }
+
+  const studentIds = [...new Set([
+    ...(paidStudentsCourse || []).map(p => p.student_id),
+    ...paidStudentsTopic.map(p => p.student_id)
+  ])];
+
+  const { data: studentProfiles } = await supabase
+    .from('profiles')
+    .select('id, full_name, email, matric_number')
+    .in('id', studentIds)
+    .eq('role', 'student');
+
+  return res.json({ message: 'Lecturer access: subscribed students only', profiles: studentProfiles || [], accessedBy: req.user.role });
+}
+
+if (req.user.role === 'student') {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', req.user.id)
+    .single();
+  if (error) throw error;
+  return res.json({ message: 'Student access: own profile only', profile: data, accessedBy: req.user.role });
+}
+
+return res.status(403).json({ error: 'Role not authorized' });  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch profiles', details: error.message });
+  }
+});// ========= COURSES =========
+// Create course (Admin or Lecturer). Admin can assign any lecturer_id. Lecturer limited to self.
+app.post('/courses', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { title, description, lecturer_id } = req.body;let assignedLecturerId = lecturer_id;
+if (req.user.role === 'lecturer') {
+  assignedLecturerId = req.user.id; // force ownership
+}
+
+const { data, error } = await supabase
+  .from('courses')
+  .insert([{ title, description, lecturer_id: assignedLecturerId, published: false }])
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Course created', course: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Edit course (Admin any, Lecturer only own)
+app.put('/courses/:id', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const courseId = req.params.id;
+    const { title, description, lecturer_id, published } = req.body;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(courseId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course' });
+}
+
+const payload = { title, description };
+if (typeof published === 'boolean') payload.published = published;
+if (req.user.role === 'admin' && lecturer_id) {
+  payload.lecturer_id = lecturer_id; // admin can reassign
+}
+
+const { data, error } = await supabase
+  .from('courses')
+  .update(payload)
+  .eq('id', courseId)
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Course updated', course: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Delete course (Admin any, Lecturer only own)
+app.delete('/courses/:id', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const courseId = req.params.id;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(courseId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course' });
+}
+
+const { error } = await supabase
+  .from('courses')
+  .delete()
+  .eq('id', courseId);
+
+if (error) throw error;
+res.json({ message: 'Course deleted' });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// List courses
+// Admin: all, Lecturer: own, Student: only paid courses
+app.get('/courses', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role === 'admin') {
+      const { data, error } = await supabase.from('courses').select('*');
+      if (error) throw error;
+      return res.json({ message: 'All courses', courses: data });
+    }if (req.user.role === 'lecturer') {
+  const { data, error } = await supabase
+    .from('courses')
+    .select('*')
+    .eq('lecturer_id', req.user.id);
+  if (error) throw error;
+  return res.json({ message: 'Lecturer courses', courses: data });
+}
+
+// student: courses unlocked via course-level paid or topic-level paid (show course if any topic under it is paid)
+const { data: coursePayments, error: cpErr } = await supabase
+  .from('payments')
+  .select('course_id')
+  .eq('student_id', req.user.id)
+  .eq('status', 'paid')
+  .not('course_id', 'is', null);
+if (cpErr) throw cpErr;
+
+const { data: topicPays, error: tpErr } = await supabase
+  .from('payments')
+  .select('topic_id')
+  .eq('student_id', req.user.id)
+  .eq('status', 'paid')
+  .not('topic_id', 'is', null);
+if (tpErr) throw tpErr;
+
+let paidCourseIds = (coursePayments || []).map(p => p.course_id);
+
+// include courses that have paid topics
+if (topicPays && topicPays.length) {
+  const topicIds = topicPays.map(t => t.topic_id);
+  const { data: topics, error: topicsErr } = await supabase
+    .from('topics')
+    .select('id, course_id')
+    .in('id', topicIds);
+  if (topicsErr) throw topicsErr;
+  const courseIdsFromTopics = (topics || []).map(t => t.course_id);
+  paidCourseIds = [...new Set([...paidCourseIds, ...courseIdsFromTopics])];
+}
+
+if (paidCourseIds.length === 0) return res.json({ message: 'No paid courses', courses: [] });
+
+const { data: courses, error } = await supabase
+  .from('courses')
+  .select('*')
+  .in('id', paidCourseIds);
+if (error) throw error;
+return res.json({ message: 'Student accessible courses (paid course or topic)', courses });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Publish course (requires min 10 topics)
+app.post('/courses/:courseId/publish', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { courseId } = req.params;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(courseId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course' });
+}
+
+const { data: topics } = await supabase
+  .from('topics')
+  .select('id')
+  .eq('course_id', courseId);
+const topicCount = (topics || []).length;
+
+if (topicCount < 10) {
+  return res.status(400).json({ error: 'Course must have at least 10 topics to publish' });
+}
+
+const { data, error } = await supabase
+  .from('courses')
+  .update({ published: true })
+  .eq('id', courseId)
+  .select();
+if (error) throw error;
+
+res.json({ message: 'Course published', course: data[0], topicCount });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= TOPICS =========
+// Create topic under a course (Admin or Lecturer owner). Enforce max 20 per course.
+app.post('/courses/:courseId/topics', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { courseId } = req.params;
+    const { title, content } = req.body;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(courseId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course' });
+}
+
+const { data: topics } = await supabase
+  .from('topics')
+  .select('id')
+  .eq('course_id', courseId);
+const topicCount = (topics || []).length;
+if (topicCount >= 20) {
+  return res.status(400).json({ error: 'Maximum 20 topics per course reached' });
+}
+
+const { data, error } = await supabase
+  .from('topics')
+  .insert([{ course_id: courseId, title, content }])
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Topic created', topic: data[0], totalTopics: topicCount + 1 });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Edit topic (Admin any, Lecturer only owner via course)
+app.put('/topics/:id', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const topicId = req.params.id;
+    const { title, content } = req.body;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfTopic(topicId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of topic' });
+}
+
+const { data, error } = await supabase
+  .from('topics')
+  .update({ title, content })
+  .eq('id', topicId)
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Topic updated', topic: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// List topics for a course (Admin all, Lecturer owner, Student paid for course OR topic)
+app.get('/courses/:courseId/topics', authenticateToken, async (req, res) => {
+  try {
+    const { courseId } = req.params;if (req.user.role === 'admin') {
+  const { data, error } = await supabase
+    .from('topics')
+    .select('*')
+    .eq('course_id', courseId);
+  if (error) throw error;
+  return res.json({ message: 'All topics for course', topics: data });
+}
+
+if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(courseId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course' });
+
+  const { data, error } = await supabase
+    .from('topics')
+    .select('*')
+    .eq('course_id', courseId);
+  if (error) throw error;
+  return res.json({ message: 'Lecturer topics', topics: data });
+}
+
+// student
+const paidCourse = await hasStudentPaidForCourse(courseId, req.user.id);
+if (!paidCourse) {
+  const { data: paidTopicPayments, error: pte } = await supabase
+    .from('payments')
+    .select('topic_id')
+    .eq('student_id', req.user.id)
+    .eq('status', 'paid')
+    .not('topic_id', 'is', null);
+  if (pte) throw pte;
+
+  const topicIds = (paidTopicPayments || []).map(p => p.topic_id);
+  if (topicIds.length === 0) return res.status(403).json({ error: 'Payment required to view topics' });
+
+  const { data: topics, error } = await supabase
+    .from('topics')
+    .select('*')
+    .in('id', topicIds)
+    .eq('course_id', courseId);
+  if (error) throw error;
+
+  return res.json({ message: 'Student topics (topic-level paid)', topics });
+}
+
+const { data, error } = await supabase
+  .from('topics')
+  .select('*')
+  .eq('course_id', courseId);
+if (error) throw error;
+return res.json({ message: 'Student topics (course-level paid)', topics: data });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= VIDEOS PER TOPIC =========
+// Add video metadata to topic (Admin or Lecturer owner)
+app.post('/topics/:topicId/videos', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { topicId } = req.params;
+    const { title, video_url, duration_minutes } = req.body;if (typeof duration_minutes !== 'number' || duration_minutes <= 0 || duration_minutes > 20) {
+  return res.status(400).json({ error: 'Video duration must be >0 and ≤ 20 minutes' });
+}
+
+if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfTopic(topicId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of topic' });
+}
+
+const { data, error } = await supabase
+  .from('videos')
+  .insert([{ topic_id: topicId, title, video_url, duration_minutes }])
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Video added', video: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// List videos for a topic (Admin all, Lecturer owner, Student paid for course OR topic)
+app.get('/topics/:topicId/videos', authenticateToken, async (req, res) => {
+  try {
+    const { topicId } = req.params;const { data: topic } = await supabase
+  .from('topics')
+  .select('id, course_id')
+  .eq('id', topicId)
+  .single();
+if (!topic) return res.status(404).json({ error: 'Topic not found' });
+
+if (req.user.role === 'admin') {
+  const { data, error } = await supabase
+    .from('videos')
+    .select('*')
+    .eq('topic_id', topicId);
+  if (error) throw error;
+  return res.json({ message: 'All videos for topic', videos: data });
+}
+
+if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(topic.course_id, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course/topic' });
+
+  const { data, error } = await supabase
+    .from('videos')
+    .select('*')
+    .eq('topic_id', topicId);
+  if (error) throw error;
+  return res.json({ message: 'Lecturer videos', videos: data });
+}
+
+// student
+const paidCourse = await hasStudentPaidForCourse(topic.course_id, req.user.id);
+const paidTopic = await hasStudentPaidForTopic(topicId, req.user.id);
+if (!paidCourse && !paidTopic) {
+  return res.status(403).json({ error: 'Payment required to view videos' });
+}
+
+const { data, error } = await supabase
+  .from('videos')
+  .select('*')
+  .eq('topic_id', topicId);
+if (error) throw error;
+return res.json({ message: 'Student videos (paid course or topic)', videos: data });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= ASSIGNMENTS =========
+// Create assignment under a topic (Admin or Lecturer owner of course/topic)
+app.post('/topics/:topicId/assignments', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { topicId } = req.params;
+    const { title, instructions, due_date } = req.body;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfTopic(topicId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of topic' });
+}
+
+const { data, error } = await supabase
+  .from('assignments')
+  .insert([{ topic_id: topicId, title, instructions, due_date }])
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Assignment created', assignment: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Edit assignment (Admin any, Lecturer only owner)
+app.put('/assignments/:id', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const assignmentId = req.params.id;
+    const { title, instructions, due_date } = req.body;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfAssignment(assignmentId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of assignment' });
+}
+
+const { data, error } = await supabase
+  .from('assignments')
+  .update({ title, instructions, due_date })
+  .eq('id', assignmentId)
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Assignment updated', assignment: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// List assignments for a topic (Admin/Lecturer: all; Student: paid for course OR topic)
+app.get('/topics/:topicId/assignments', authenticateToken, async (req, res) => {
+  try {
+    const { topicId } = req.params;const { data: topic } = await supabase
+  .from('topics')
+  .select('id, course_id')
+  .eq('id', topicId)
+  .single();
+if (!topic) return res.status(404).json({ error: 'Topic not found' });
+
+if (req.user.role === 'admin') {
+  const { data, error } = await supabase
+    .from('assignments')
+    .select('*')
+    .eq('topic_id', topicId);
+  if (error) throw error;
+  return res.json({ message: 'All assignments for topic', assignments: data });
+}
+
+if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(topic.course_id, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course/topic' });
+
+  const { data, error } = await supabase
+    .from('assignments')
+    .select('*')
+    .eq('topic_id', topicId);
+  if (error) throw error;
+  return res.json({ message: 'Lecturer assignments', assignments: data });
+}
+
+// student
+const paidCourse = await hasStudentPaidForCourse(topic.course_id, req.user.id);
+const paidTopic = await hasStudentPaidForTopic(topicId, req.user.id);
+if (!paidCourse && !paidTopic) {
+  return res.status(403).json({ error: 'Payment required to view assignments' });
+}
+
+const { data, error } = await supabase
+  .from('assignments')
+  .select('*')
+  .eq('topic_id', topicId);
+if (error) throw error;
+return res.json({ message: 'Student assignments (paid course or topic)', assignments: data });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// ========= TRCN ACCESS CHECK =========
+// New endpoint for TRCN login/access (fetches from profiles, checks payments)
+app.post('/trcn/access', async (req, res) => {
+  try {
+    const { identifier } = req.body; // TRCN Reg No or Matric Noif (!identifier?.trim()) {
+  return res.status(400).json({ error: 'Please enter a valid TRCN Reg No or Matric Number' });
+}
+
+// Step 1: Fetch user from profiles table (match on matric_number for now)
+// Later: Extend to match on a future 'trcn_reg_no' field in profiles or a new trcn_registrations table
+const { data: userProfile, error: profileError } = await supabase
+  .from('profiles')
+  .select('id, user_id, full_name, email, matric_number, role') // Fetch relevant details (no password!)
+  .eq('matric_number', identifier) // For now, assume identifier = matric_number
+  .eq('role', 'student') // Only students for TRCN
+  .maybeSingle();
+
+if (profileError) throw profileError;
+if (!userProfile) {
+  return res.status(404).json({ error: 'No user found with this Matric Number or TRCN Reg No' });
+}
+
+// Prepare for future TRCN reg table (commented out for now)
+// const { data: trcnReg, error: regError } = await supabase
+//   .from('trcn_registrations') // Future table: { id, reg_no, student_id, ... }
+//   .select('*')
+//   .eq('reg_no', identifier)
+//   .maybeSingle();
+// if (regError || !trcnReg) return res.status(404).json({ error: 'Invalid TRCN Registration' });
+
+// Step 2: Check for valid TRCN payment (trcn = true, status = 'paid')
+const { data: payment, error: paymentError } = await supabase
+  .from('payments')
+  .select('id, status, created_at')
+  .eq('student_id', userProfile.id) // Or userProfile.user_id if you fixed the JWT id mismatch earlier
+  .eq('trcn', true)
+  .eq('status', 'paid')
+  .maybeSingle();
+
+if (paymentError) throw paymentError;
+if (!payment) {
+  return res.status(403).json({ 
+    paid: false,
+    error: 'Access denied. Please complete payment for TRCN practice.'
+  });
+}
+
+// Step 3: Generate a simple token/session for TRCN access (expires in 7d, like normal JWT)
+// This grants access until admin ends semester (which can reset payments)
+const trcnToken = jwt.sign(
+  { user_id: userProfile.user_id, role: 'student', trcnAccess: true },
+  process.env.JWT_SECRET,
+  { expiresIn: '7d' } // Short-term; admin end-semester can invalidate by updating payments
+);
+
+res.json({
+  paid: true,
+  message: 'TRCN access granted',
+  user: userProfile, // Details from profiles table
+  token: trcnToken, // Use this for subsequent TRCN calls (e.g., questions)
+  // Future: Add trcnReg details here if using separate table
+});  } catch (err) {
+    console.error('TRCN access error:', err.message);
+    res.status(500).json({ error: 'Server error - please try again' });
+  }
+});
+// ========= SUBMISSIONS =========
+// Student submits text-based assignment attempt
+app.post('/assignments/:id/submissions', authenticateToken, authorizeRoles('student'), async (req, res) => {
+  try {
+    const assignmentId = req.params.id;
+    const { content } = req.body;if (typeof content !== 'string' || content.trim().length === 0) {
+  return res.status(400).json({ error: 'Submission content must be non-empty text' });
+}
+
+const { data: assignment } = await supabase
+  .from('assignments')
+  .select('id, topic_id')
+  .eq('id', assignmentId)
+  .single();
+if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
+
+const { data: topic } = await supabase
+  .from('topics')
+  .select('id, course_id')
+  .eq('id', assignment.topic_id)
+  .single();
+if (!topic) return res.status(404).json({ error: 'Topic not found' });
+
+const paidCourse = await hasStudentPaidForCourse(topic.course_id, req.user.id);
+const paidTopic = await hasStudentPaidForTopic(topic.id, req.user.id);
+if (!paidCourse && !paidTopic) {
+  return res.status(403).json({ error: 'Payment required to submit assignment' });
+}
+
+const { data, error } = await supabase
+  .from('submissions')
+  .insert([{ assignment_id: assignmentId, student_id: req.user.id, content }])
+  .select();
+
+if (error) throw error;
+res.json({ message: 'Submission created', submission: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Lecturer/Admin view submissions for an assignment
+app.get('/assignments/:id/submissions', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const assignmentId = req.params.id;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfAssignment(assignmentId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of assignment' });
+}
+
+const { data, error } = await supabase
+  .from('submissions')
+  .select('*')
+  .eq('assignment_id', assignmentId);
+
+if (error) throw error;
+res.json({ message: 'Submissions fetched', submissions: data });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= PAYMENTS =========
+// Admin lists payments
+app.get('/payments', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('payments')
+      .select('*');
+    if (error) throw error;
+    res.json({ message: 'All payments', payments: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Admin records payment (course or topic or TRCN)
+app.post('/payments', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const { student_id, course_id, topic_id, status } = req.body; // status: 'paid' | 'pending' | 'failed'
+    if (!student_id) return res.status(400).json({ error: 'student_id is required' });let baseAmount;
+if (course_id) baseAmount = PRICING.COURSE;
+else if (topic_id) baseAmount = PRICING.TOPIC;
+else baseAmount = PRICING.TRCN;
+
+const serviceFee = Math.round(baseAmount * PRICING.DEVELOPER_FEE);
+const totalAmount = baseAmount + serviceFee;
+
+const { data, error } = await supabase
+  .from('payments')
+  .insert([{
+    student_id,
+    course_id: course_id || null,
+    topic_id: topic_id || null,
+    trcn: !course_id && !topic_id ? true : false,
+    status: status || 'paid',
+    amount: totalAmount,
+    service_fee: serviceFee
+  }])
+  .select();
+if (error) throw error;
+
+res.json({ message: 'Payment recorded', payment: data[0] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= LECTURER ACCOUNTS (ADMIN ONLY) =========
+app.get('/lecturer-accounts', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('lecturer_accounts')
+      .select('*');
+    if (error) throw error;
+    res.json({ message: 'Lecturer accounts fetched', accounts: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});app.post('/lecturer-accounts', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const { lecturer_id, account_name, bank, account_number } = req.body;
+    const { data, error } = await supabase
+      .from('lecturer_accounts')
+      .insert([{ lecturer_id, account_name, bank, account_number }])
+      .select();
+    if (error) throw error;
+    res.json({ message: 'Lecturer account added', account: data[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});app.delete('/lecturer-accounts/:id', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from('lecturer_accounts')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+    res.json({ message: 'Lecturer account deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= STUDENTS PER COURSE/TOPIC =========
+app.get('/courses/:courseId/students', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { courseId } = req.params;if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(courseId, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course' });
+}
+
+const { data: paymentsCourse } = await supabase
+  .from('payments')
+  .select('student_id')
+  .eq('course_id', courseId)
+  .eq('status', 'paid');
+
+const { data: courseTopics } = await supabase
+  .from('topics')
+  .select('id')
+  .eq('course_id', courseId);
+
+const topicIds = (courseTopics || []).map(t => t.id);
+let paymentsTopic = [];
+if (topicIds.length) {
+  const { data: pt } = await supabase
+    .from('payments')
+    .select('student_id')
+    .in('topic_id', topicIds)
+    .eq('status', 'paid');
+  paymentsTopic = pt || [];
+}
+
+const studentIds = [...new Set([
+  ...(paymentsCourse || []).map(p => p.student_id),
+  ...paymentsTopic.map(p => p.student_id)
+])];
+
+const { data: profiles } = await supabase
+  .from('profiles')
+  .select('id, full_name, email, matric_number')
+  .in('id', studentIds)
+  .eq('role', 'student');
+
+res.json({ message: 'Students for course', students: profiles || [] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});app.get('/topics/:topicId/students', authenticateToken, authorizeRoles('admin', 'lecturer'), async (req, res) => {
+  try {
+    const { topicId } = req.params;const { data: topic } = await supabase
+  .from('topics')
+  .select('id, course_id')
+  .eq('id', topicId)
+  .single();
+if (!topic) return res.status(404).json({ error: 'Topic not found' });
+
+if (req.user.role === 'lecturer') {
+  const owns = await isLecturerOwnerOfCourse(topic.course_id, req.user.id);
+  if (!owns) return res.status(403).json({ error: 'Forbidden: not owner of course/topic' });
+}
+
+const { data: payments } = await supabase
+  .from('payments')
+  .select('student_id')
+  .eq('topic_id', topicId)
+  .eq('status', 'paid');
+
+const studentIds = [...new Set((payments || []).map(p => p.student_id))];
+
+const { data: profiles } = await supabase
+  .from('profiles')
+  .select('id, full_name, email, matric_number')
+  .in('id', studentIds)
+  .eq('role', 'student');
+
+res.json({ message: 'Students for topic', students: profiles || [] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// Get questions with variable count (student) without answers
+app.get('/trcn/questions', authenticateToken, authorizeRoles('student'), async (req, res) => {
+  try {
+    const count = parseInt(req.query.count) || 20;
+    if (count % 10 !== 0 || count < 20 || count > 100) {
+      return res.status(400).json({ error: 'Count must be 20–100 in increments of 10' });
+    }const { data, error } = await supabase
+  .from('trcn_questions')
+  .select('id, question, options')
+  .limit(count);
+if (error) throw error;
+res.json({ message: `TRCN questions fetched (${count})`, questions: data || [] });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= TRCN TEST SUBMISSION & GRADING =========
+// Submit answers, grade server-side, increment attempt count, save result
+app.post('/trcn/results', authenticateToken, authorizeRoles('student'), async (req, res) => {
+  try {
+    const { answers } = req.body; // Expect array: [{ question_id, selected_option }]
+    if (!Array.isArray(answers) || answers.length === 0) {
+      return res.status(400).json({ error: 'Answers must be a non-empty array' });
+    }const questionIds = answers.map(a => a.question_id);
+const { data: questions, error: qErr } = await supabase
+  .from('trcn_questions')
+  .select('id, correct_option')
+  .in('id', questionIds);
+
+if (qErr) throw qErr;
+if (questions.length !== answers.length) {
+  return res.status(400).json({ error: 'One or more questions not found' });
+}
+
+const correctMap = new Map(questions.map(q => [q.id, q.correct_option]));
+let correctCount = 0;
+
+for (const ans of answers) {
+  if (correctMap.get(ans.question_id) === ans.selected_option) {
+    correctCount++;
+  }
+}
+
+const score = correctCount;
+const total = answers.length;
+
+// Increment attempt count and save result in trcn_tests_results
+const { data: existingResult, error: fetchErr } = await supabase
+  .from('trcn_tests_results')
+  .select('attempts_count')
+  .eq('student_id', req.user.id)
+  .maybeSingle();
+
+let newAttemptCount = (existingResult?.attempts_count || 0) + 1;
+
+const { data: result, error: saveErr } = await supabase
+  .from('trcn_tests_results')
+  .upsert(
+    { 
+      student_id: req.user.id,
+      score,
+      total_questions: total,
+      attempts_count: newAttemptCount,
+      last_attempt: new Date().toISOString()
+    },
+    { onConflict: 'student_id' } // Upsert on student_id
+  )
+  .select();
+
+if (saveErr) throw saveErr;
+
+res.json({ 
+  message: 'TRCN test graded and attempt recorded', 
+  score,
+  total,
+  percentage: Math.round((score / total) * 100),
+  attempts_count: newAttemptCount,
+  result: result[0]
+});  } catch (err) {
+    console.error('TRCN submission error:', err.message);
+    res.status(500).json({ error: 'Failed to submit test' });
+  }
+});// ========= END SEMESTER (ADMIN) =========
+app.post('/admin/end-semester', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const { error: subErr } = await supabase
+      .from('submissions')
+      .delete()
+      .neq('id', null);
+    if (subErr) throw subErr;const { error: trcnErr } = await supabase
+  .from('trcn_tests_results')
+  .delete()
+  .neq('id', null);
+if (trcnErr) throw trcnErr;// New: Reset TRCN payments to expire access (without deleting)
+    const { error: paymentErr } = await supabase
+      .from('payments')
+      .update({ status: 'expired' })
+      .eq('trcn', true);if (paymentErr) throw paymentErr;
+res.json({ message: 'Semester ended: student records erased (submissions, TRCN results)' });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= FLUTTERWAVE WEBHOOK =========
+app.post('/flutterwave/webhook', async (req, res) => {
+  try {
+    const secret = process.env.FLW_SECRET_KEY;// Verify signature
+const signature = req.headers['verif-hash'];
+if (!signature || signature !== secret) {
+  return res.status(401).json({ error: 'Invalid signature' });
+}
+
+const payload = req.body;
+const { status, tx_ref } = payload.data;
+
+if (status === 'successful') {
+  // tx_ref format: "course:COURSE_ID:STUDENT_ID"
+  // or "topic:TOPIC_ID:STUDENT_ID"
+  // or "trcn:REG_NO:STUDENT_ID"
+  const parts = tx_ref.split(':');
+  const type = parts[0];
+  const targetId = parts[1];
+  const studentId = parts[2];
+
+  let baseAmount;
+  if (type === 'course') baseAmount = PRICING.COURSE;
+  else if (type === 'topic') baseAmount = PRICING.TOPIC;
+  else if (type === 'trcn') baseAmount = PRICING.TRCN;
+
+  const serviceFee = Math.round(baseAmount * PRICING.DEVELOPER_FEE);
+  const totalAmount = baseAmount + serviceFee;
+
+  let insertData = {
+    student_id: studentId || null,
+    status: 'paid',
+    amount: totalAmount,
+    service_fee: serviceFee,
+    tx_ref, //  store tx_ref for idempotency
+  };
+
+  if (type === 'course') insertData.course_id = targetId;
+  else if (type === 'topic') insertData.topic_id = targetId;
+  else if (type === 'trcn') insertData.trcn = true;
+
+  //  Idempotency check: avoid duplicate inserts
+  const { data: existing, error: checkError } = await supabase
+    .from('payments')
+    .select('id')
+    .eq('tx_ref', tx_ref)
+    .limit(1);
+
+  if (checkError) {
+    console.error("Error checking existing payment:", checkError.message);
+  }
+
+  if (!existing || existing.length === 0) {
+    const { error: insertError } = await supabase.from('payments').insert([insertData]);
+    if (insertError) {
+      console.error("Payment insert failed:", insertError.message, insertData);
+      throw insertError;
+    } else {
+      console.log(" Payment recorded:", insertData);
+    }
+  } else {
+    console.log(" Payment already recorded for tx_ref:", tx_ref);
+  }
+}
+
+res.json({ message: 'Webhook processed' });  } catch (err) {
+    console.error("Webhook error:", err.message, req.body);
+    res.status(500).json({ error: err.message });
+  }
+});// ========= UPDATE USER ROLE (ADMIN ONLY) =========
+app.patch('/profiles/:id/role', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body;  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ role })
+      .eq('id', id);if (error) throw error;
+
+res.json({ message: `User role updated successfully to ${role}` });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});// ========= DELETE USER (ADMIN ONLY) =========
+app.delete('/profiles/:id', authenticateToken, authorizeRoles('admin'), async (req, res) => {
+  const { id } = req.params;  try {
+    const { error } = await supabase
+      .from('profiles')
+      .delete()
+      .eq('id', id);if (error) throw error;
+
+res.json({ message: 'User deleted successfully' });  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// ===== TRCN Question Seeder =====
+async function seedTrcnQuestions() {
+  try {
+    // Check if questions already exist
+    const { data: existing, error: checkError } = await supabase
+      .from("trcn_questions")
+      .select("id")
+      .limit(1);if (checkError) {
+  console.error("Error checking TRCN questions:", checkError.message);
+  return;
+}
+
+if (existing && existing.length > 0) {
+  console.log("TRCN questions already seeded.");
+  return;
+}
+
+// Build 200 random questions
+const questions = [];
+for (let i = 1; i <= 200; i++) {
+  questions.push({
+    question: `Sample TRCN Question ${i}: What is ${i}+${i}?`,
+    options: [
+      `${i}`, 
+      `${i * 2}`, 
+      `${i + 1}`, 
+      `${i - 1}`
+    ],
+    correct_option: `${i * 2}`, // correct answer
+  });
+}
+
+// Insert into DB
+const { error: insertError } = await supabase
+  .from("trcn_questions")
+  .insert(questions);
+
+if (insertError) {
+  console.error("Error seeding TRCN questions:", insertError.message);
+} else {
+  console.log(" Seeded 200 TRCN questions successfully.");
+}  } catch (err) {
+    console.error("Unexpected error seeding TRCN questions:", err.message);
+  }
+}// Call seeder on server start
+seedTrcnQuestions();
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];  console.log("Auth header received:", authHeader);           // ← DEBUG
+  console.log("Extracted token:", token ? token.substring(0, 10) + "..." : "NO TOKEN"); // partial for security  if (!token) {
+    console.log("No token provided – returning 401");
+    return res.status(401).json({ error: 'Access denied. No token provided.' });
+  }  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+    if (err) {
+      console.log("Token verification failed:", err.message);
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+    console.log("Token verified – payload:", payload);
+    req.user = payload;
+    next();
+  });
+}// ========= SERVER =========
+app.listen(port, () => {
+  console.log(Backend server is running on http://localhost:${port});
+});
+
