@@ -1,0 +1,15 @@
+# dependencies
+/node_modules
+
+# build output
+/build
+
+# misc
+*.log
+.env
+.DS_Store
+.vscode/
+
+# temporary files
+*.tmp
+*.swp
